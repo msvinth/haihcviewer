@@ -1,4 +1,5 @@
 default_config:
+cloud:
 ihc:
   - url: !secret ihc_url
     username: !secret ihc_username
