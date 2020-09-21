@@ -13,12 +13,15 @@ import homeassistant.core as ha
 from homeassistant.components.ihc import IHC_CONTROLLER
 from homeassistant.components.http import HomeAssistantView
 
-REQUIREMENTS = ["ihcsdk==2.6.0"]
+from custom_components.ihcviewer.const import DOMAIN, NAME_SHORT, VERSION
+
+REQUIREMENTS = ["ihcsdk==2.7.0"]
 DEPENDENCIES = ["ihc"]
 
-DOMAIN = "ihcviewer"
-
 _LOGGER = logging.getLogger(__name__)
+
+# We hold a global cached list of the mapping
+ihcmapping = None
 
 
 async def async_setup(hass, config):
@@ -29,41 +32,39 @@ async def async_setup(hass, config):
     hass.http.register_view(IHCLogView(ihc_controller, hass))
     hass.http.register_view(IHCProjectView(ihc_controller, hass))
     hass.http.register_view(IHCGetValue(ihc_controller, hass))
+    hass.http.register_view(IHCMapping(hass))
+    hass.http.register_view(NpmView(hass))
 
     register_frontend(hass)
+    add_side_panel(hass, conf)
+    return True
 
-    name = "panel"
-    filename = "panel.html"
 
-    panelpath = os.path.join(os.path.dirname(__file__), filename)
-    html_url = "/api/ihcviewer/{}".format(name)
-    hass.http.register_static_path(html_url, panelpath)
+def add_side_panel(hass, conf):
+    """Add the IHCViewer sidepanel"""
 
     custom_panel_config = {
-        "name": "ihcviewer",
+        "name": "ha-panel-ihcviewer",
         "embed_iframe": False,
         "trust_external": False,
-        "html_url": html_url,
+        "module_url": f"/ihcviewer/frontend-{VERSION}/panel.js",
     }
-
     if conf is not None:
         # Make copy because we're mutating it
         conf = dict(conf)
     else:
         conf = {}
-
     conf["_panel_custom"] = custom_panel_config
-
+    conf["version"] = VERSION
     hass.components.frontend.async_register_built_in_panel(
         component_name="custom",
-        frontend_url_path="ihc-viewer",
-        sidebar_title="IHC Viewer",
+        frontend_url_path="ihc_viewer",
+        sidebar_title=NAME_SHORT,
         sidebar_icon="mdi:file-tree",
         config=conf,
         require_admin=True,
     )
-
-    return True
+    return
 
 
 def register_frontend(hass):
@@ -74,8 +75,8 @@ def register_frontend(hass):
         ext = os.path.splitext(filename)[1].lower()
         if ext == ".png" or ext == ".html" or ext == ".js":
             hass.http.register_static_path(
-                url_path="/ihcviewer/{}".format(filename),
-                path=os.path.join(path, filename),
+                f"/ihcviewer/frontend-{VERSION}/{filename}",
+                os.path.join(path, filename),
             )
 
 
@@ -85,8 +86,8 @@ class IHCLogView(HomeAssistantView):
     from ihcsdk.ihccontroller import IHCController
     from ihcsdk.ihcclient import IHCSoapClient
 
-    url = "/api/ihc/log"
-    name = "api:ihc:log"
+    url = "/api/ihcviewer/log"
+    name = "api:ihcviewer:log"
 
     def __init__(self, ihc_controller, hass):
         """Initilalize the IHCLog view."""
@@ -97,7 +98,7 @@ class IHCLogView(HomeAssistantView):
     @ha.callback
     async def get(self, request):
         """Retrieve IHC log."""
-        log  = await self.hass.async_add_executor_job( self.get_user_log)
+        log = await self.hass.async_add_executor_job(self.get_user_log)
         return self.json(log)
 
     ihcns = {
@@ -123,9 +124,9 @@ class IHCLogView(HomeAssistantView):
                 "./SOAP-ENV:Body/ns1:getUserLog4/ns1:data", IHCLogView.ihcns
             ).text
             if not base64data:
-                return False
+                return ""
             return base64.b64decode(base64data).decode("UTF-8")
-        return False
+        return ""
 
 
 class IHCProjectView(HomeAssistantView):
@@ -134,8 +135,8 @@ class IHCProjectView(HomeAssistantView):
     from ihcsdk.ihccontroller import IHCController
     from ihcsdk.ihcclient import IHCSoapClient
 
-    url = "/api/ihc/project"
-    name = "api:ihc:project"
+    url = "/api/ihcviewer/project"
+    name = "api:ihcviewer:project"
 
     def __init__(self, ihc_controller, hass):
         """Initilalize the IHCProjectView."""
@@ -146,7 +147,9 @@ class IHCProjectView(HomeAssistantView):
     @ha.callback
     async def get(self, request):
         """Retrieve IHC project."""
-        project = await self.hass.async_add_executor_job( self.ihc_controller.get_project)
+        project = await self.hass.async_add_executor_job(
+            self.ihc_controller.get_project
+        )
         return web.Response(
             body=project, content_type="text/xml", charset="utf-8", status=200
         )
@@ -158,8 +161,8 @@ class IHCGetValue(HomeAssistantView):
     from ihcsdk.ihccontroller import IHCController
     from ihcsdk.ihcclient import IHCSoapClient
 
-    url = "/api/ihc/getvalue"
-    name = "api:ihc:getvalue"
+    url = "/api/ihcviewer/getvalue"
+    name = "api:ihcviewer:getvalue"
 
     def __init__(self, ihc_controller, hass):
         """Initilalize the IHCGetValue."""
@@ -172,5 +175,67 @@ class IHCGetValue(HomeAssistantView):
         """Get runtime value from IHC controller."""
         data = request.query
         id = int(data.get("id"))
-        value = await self.hass.async_add_executor_job( self.ihc_controller.client.get_runtime_value,id)
-        return self.json({"value": value, "type": type(value).__name__})
+        value = await self.hass.async_add_executor_job(
+            self.ihc_controller.client.get_runtime_value, id
+        )
+        entity_id = ""
+        global ihcmapping
+        if ihcmapping is not None and id in ihcmapping:
+            entity_id = ihcmapping[id]
+        json = {"value": value, "type": type(value).__name__, "entity": entity_id}
+        return self.json(json)
+
+
+class IHCMapping(HomeAssistantView):
+    """Get mapping of ihc id's to entities."""
+
+    url = "/api/ihcviewer/mapping"
+    name = "api:ihcviewer:mapping"
+
+    def __init__(self, hass):
+        """Initilalize the IHCGetValue."""
+        self.hass = hass
+
+    @ha.callback
+    async def get(self, request):
+        """Get ihc mapping."""
+
+        allstates = await self.hass.async_add_executor_job(self.hass.states.all)
+        global ihcmapping
+        ihcmapping = {}
+        for state in allstates:
+            if "ihc_id" in state.attributes:
+                ihcmapping[state.attributes["ihc_id"]] = state.entity_id
+        return self.json(ihcmapping)
+
+
+class NpmView(HomeAssistantView):
+    """npm modules"""
+
+    requires_auth = False
+    name = "ihcviewer_npm"
+    url = r"/ihcviewer_npm/{requested_file:.+}"
+
+    def __init__(self, hass):
+        """Initilalize the IHCGetValue."""
+        self.hass = hass
+
+    @ha.callback
+    async def get(self, request, requested_file):  # pylint: disable=unused-argument
+        """Handle module Web requests."""
+        response = await self.hass.async_add_executor_job(
+            get_file_response, requested_file
+        )
+        return response
+
+
+def get_file_response(requested_file):
+    """Get file."""
+
+    dir = os.path.dirname(__file__)
+    servefile = f"{dir}/node_modules/{requested_file}"
+    if os.path.exists(servefile):
+        response = web.FileResponse(servefile)
+        return response
+
+    return web.Response(status=404)
